@@ -23,6 +23,10 @@ class BankAccountSerializer(serializers.ModelSerializer):
 class PayoutSerializer(serializers.ModelSerializer):
     merchant_id = serializers.CharField(source='merchant.id', read_only=True)
     bank_account_id = serializers.CharField(source='bank_account.id', read_only=True)
+    failure_reason = serializers.SerializerMethodField()
+
+    def get_failure_reason(self, obj):
+        return obj.failure_reason or None
     
     class Meta:
         model = Payout

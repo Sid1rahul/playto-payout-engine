@@ -3,6 +3,7 @@ from rest_framework.response import Response
 from rest_framework import status
 from django.shortcuts import get_object_or_404
 from django.db.models import Q
+from django.core.exceptions import ValidationError as DjangoValidationError
 from datetime import datetime
 import logging
 import uuid
@@ -135,7 +136,7 @@ class MerchantPayoutsView(APIView):
 
 
 class PayoutCreateView(APIView):
-    """POST /api/v1/payouts/
+    """POST /api/v1/payouts/ and GET /api/v1/payouts/?merchant_id=...
     
     Create a new payout request. Requires Idempotency-Key header for safe retries.
     
@@ -156,6 +157,73 @@ class PayoutCreateView(APIView):
         404 Not Found: Merchant or bank account not found
         422 Unprocessable Entity: Validation error (e.g., insufficient balance)
     """
+    def get(self, request):
+        merchant_id = request.query_params.get("merchant_id")
+        if not merchant_id:
+            logger.warning("Payout list request missing merchant_id query parameter")
+            code, message = ValidationError.MISSING_FIELD
+            return APIResponse.error(
+                error="merchant_id query parameter is required",
+                code=code,
+                status_code=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            merchant_uuid = uuid.UUID(merchant_id)
+        except (ValueError, TypeError):
+            logger.warning(f"Invalid merchant_id format in payout list: {merchant_id}")
+            code, message = ValidationError.INVALID_UUID
+            return APIResponse.error(
+                error="merchant_id must be a valid UUID",
+                code=code,
+                status_code=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            merchant = Merchant.objects.get(pk=merchant_uuid)
+        except Merchant.DoesNotExist:
+            logger.warning(f"Merchant {merchant_id} not found in payout list")
+            code, message = ValidationError.NOT_FOUND
+            return APIResponse.error(
+                error="Merchant not found",
+                code=code,
+                status_code=status.HTTP_404_NOT_FOUND
+            )
+
+        queryset = Payout.objects.select_related(
+            "merchant", "bank_account"
+        ).filter(merchant=merchant)
+
+        status_filter = request.query_params.get("status")
+        if status_filter:
+            valid_statuses = [choice[0] for choice in Payout.STATUS_CHOICES]
+            if status_filter not in valid_statuses:
+                logger.warning(f"Invalid status filter: {status_filter}")
+                code, message = ValidationError.INVALID_TYPE
+                return APIResponse.error(
+                    error=f"Invalid status. Must be one of: {', '.join(valid_statuses)}",
+                    code=code,
+                    status_code=status.HTTP_400_BAD_REQUEST
+                )
+            queryset = queryset.filter(status=status_filter)
+
+        try:
+            limit = int(request.query_params.get("limit", 100))
+            if limit <= 0 or limit > 1000:
+                limit = 100
+        except (ValueError, TypeError):
+            limit = 100
+
+        payouts = queryset.order_by("-created_at")[:limit]
+        serializer = PayoutSerializer(payouts, many=True)
+        data = {
+            "merchant_id": str(merchant.id),
+            "count": len(payouts),
+            "payouts": serializer.data,
+        }
+        logger.debug(f"Returned {len(payouts)} payouts for merchant {merchant_id}")
+        return APIResponse.success(data=data, status_code=200)
+
     def post(self, request):
         idempotency_key = request.headers.get("Idempotency-Key")
 
@@ -253,8 +321,21 @@ class PayoutDetailView(APIView):
     """
     def get(self, request, payout_id):
         try:
-            payout = Payout.objects.get(pk=payout_id)
-        except Payout.DoesNotExist:
+            payout_uuid = uuid.UUID(payout_id)
+        except (ValueError, TypeError):
+            logger.warning(f"Invalid payout_id format: {payout_id}")
+            code, message = ValidationError.INVALID_UUID
+            return APIResponse.error(
+                error="payout_id must be a valid UUID",
+                code=code,
+                status_code=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            payout = Payout.objects.select_related(
+                "merchant", "bank_account"
+            ).get(pk=payout_uuid)
+        except (Payout.DoesNotExist, DjangoValidationError):
             logger.warning(f"Payout {payout_id} not found")
             code, message = ValidationError.NOT_FOUND
             return APIResponse.error(
