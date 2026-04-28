@@ -21,10 +21,13 @@ class BankAccountSerializer(serializers.ModelSerializer):
 
 
 class PayoutSerializer(serializers.ModelSerializer):
+    merchant_id = serializers.CharField(source='merchant.id', read_only=True)
+    bank_account_id = serializers.CharField(source='bank_account.id', read_only=True)
+    
     class Meta:
         model = Payout
         fields = [
-            'id', 'merchant', 'bank_account', 'amount_paise', 'status',
+            'id', 'merchant_id', 'bank_account_id', 'amount_paise', 'status',
             'idempotency_key', 'attempt_count', 'failure_reason',
             'processing_started_at', 'created_at', 'updated_at'
         ]

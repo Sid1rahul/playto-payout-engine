@@ -2,71 +2,181 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
 from django.shortcuts import get_object_or_404
+from django.db.models import Q
+from datetime import datetime
+import logging
+import uuid
+
 from .models import Merchant, Payout, Transaction, BankAccount
 from .services import create_payout
 from .serializers import MerchantSerializer, TransactionSerializer, PayoutSerializer
-import uuid
+from .utils import APIResponse, ValidationError
+
+logger = logging.getLogger('payouts')
 
 
 class MerchantBalanceView(APIView):
-    """GET /api/v1/merchants/{id}/balance/"""
+    """GET /api/v1/merchants/{id}/balance/
+    
+    Returns the current balance for a merchant, including available and held amounts.
+    """
     def get(self, request, merchant_id):
         try:
             merchant = Merchant.objects.get(pk=merchant_id)
         except Merchant.DoesNotExist:
-            return Response({"error": "Merchant not found"}, status=status.HTTP_404_NOT_FOUND)
+            logger.warning(f"Merchant {merchant_id} not found")
+            code, message = ValidationError.NOT_FOUND
+            return APIResponse.error(
+                error="Merchant not found",
+                code=code,
+                status_code=status.HTTP_404_NOT_FOUND
+            )
 
-        return Response({
+        data = {
             "merchant_id": str(merchant.id),
             "merchant_name": merchant.name,
             "available_balance_paise": merchant.get_available_balance(),
             "held_balance_paise": merchant.get_held_balance(),
-        })
+        }
+        return APIResponse.success(data=data, status_code=200)
 
 
 class MerchantTransactionsView(APIView):
-    """GET /api/v1/merchants/{id}/transactions/"""
+    """GET /api/v1/merchants/{id}/transactions/?limit=100
+    
+    Returns the transaction history for a merchant.
+    """
     def get(self, request, merchant_id):
         try:
             merchant = Merchant.objects.get(pk=merchant_id)
         except Merchant.DoesNotExist:
-            return Response({"error": "Merchant not found"}, status=status.HTTP_404_NOT_FOUND)
+            logger.warning(f"Merchant {merchant_id} not found")
+            code, message = ValidationError.NOT_FOUND
+            return APIResponse.error(
+                error="Merchant not found",
+                code=code,
+                status_code=status.HTTP_404_NOT_FOUND
+            )
 
-        transactions = merchant.transactions.all().order_by('-created_at')[:100]
+        try:
+            limit = int(request.query_params.get('limit', 100))
+            if limit <= 0 or limit > 1000:
+                limit = 100
+        except (ValueError, TypeError):
+            limit = 100
+
+        transactions = merchant.transactions.all().order_by('-created_at')[:limit]
         serializer = TransactionSerializer(transactions, many=True)
-        return Response(serializer.data)
+        
+        data = {
+            "merchant_id": str(merchant.id),
+            "count": len(transactions),
+            "transactions": serializer.data
+        }
+        return APIResponse.success(data=data, status_code=200)
 
 
 class MerchantPayoutsView(APIView):
-    """GET /api/v1/merchants/{id}/payouts/"""
+    """GET /api/v1/merchants/{id}/payouts/?status=pending&limit=100
+    
+    Returns the payout history for a merchant with optional filtering by status.
+    Query parameters:
+        - status: Filter by payout status (pending, processing, completed, failed)
+        - limit: Maximum number of results (1-1000, default 100)
+    """
     def get(self, request, merchant_id):
         try:
             merchant = Merchant.objects.get(pk=merchant_id)
         except Merchant.DoesNotExist:
-            return Response({"error": "Merchant not found"}, status=status.HTTP_404_NOT_FOUND)
+            logger.warning(f"Merchant {merchant_id} not found")
+            code, message = ValidationError.NOT_FOUND
+            return APIResponse.error(
+                error="Merchant not found",
+                code=code,
+                status_code=status.HTTP_404_NOT_FOUND
+            )
 
-        payouts = merchant.payouts.all().order_by('-created_at')[:100]
+        # Build queryset with optional filtering
+        queryset = merchant.payouts.all()
+        
+        # Filter by status if provided
+        status_filter = request.query_params.get('status')
+        if status_filter:
+            valid_statuses = [choice[0] for choice in Payout.STATUS_CHOICES]
+            if status_filter not in valid_statuses:
+                logger.warning(f"Invalid status filter: {status_filter}")
+                code, message = ValidationError.INVALID_TYPE
+                return APIResponse.error(
+                    error=f"Invalid status. Must be one of: {', '.join(valid_statuses)}",
+                    code=code,
+                    status_code=status.HTTP_400_BAD_REQUEST
+                )
+            queryset = queryset.filter(status=status_filter)
+            logger.debug(f"Filtering payouts for merchant {merchant_id} by status {status_filter}")
+        
+        # Pagination with limit parameter
+        try:
+            limit = int(request.query_params.get('limit', 100))
+            if limit <= 0 or limit > 1000:
+                limit = 100
+        except (ValueError, TypeError):
+            limit = 100
+        
+        payouts = queryset.order_by('-created_at')[:limit]
         serializer = PayoutSerializer(payouts, many=True)
-        return Response(serializer.data)
+        
+        data = {
+            "merchant_id": str(merchant.id),
+            "count": len(payouts),
+            "payouts": serializer.data
+        }
+        logger.debug(f"Returned {len(payouts)} payouts for merchant {merchant_id}")
+        return APIResponse.success(data=data, status_code=200)
 
 
 class PayoutCreateView(APIView):
-    """POST /api/v1/payouts/"""
+    """POST /api/v1/payouts/
+    
+    Create a new payout request. Requires Idempotency-Key header for safe retries.
+    
+    Request body:
+    {
+        "merchant_id": "<uuid>",
+        "amount_paise": <integer>,
+        "bank_account_id": "<uuid>"
+    }
+    
+    Headers:
+        Idempotency-Key: <uuid> (required, for idempotency)
+    
+    Returns:
+        201 Created: Payout was successfully created
+        200 OK: Duplicate request with same Idempotency-Key
+        400 Bad Request: Invalid input
+        404 Not Found: Merchant or bank account not found
+        422 Unprocessable Entity: Validation error (e.g., insufficient balance)
+    """
     def post(self, request):
         idempotency_key = request.headers.get("Idempotency-Key")
 
         # Validate idempotency key presence and format
         if not idempotency_key:
-            return Response(
-                {"error": "Idempotency-Key header is required"},
-                status=status.HTTP_400_BAD_REQUEST
+            logger.warning("Payout creation request missing Idempotency-Key header")
+            code, message = ValidationError.MISSING_FIELD
+            return APIResponse.error(
+                error="Idempotency-Key header is required",
+                code=code,
+                status_code=status.HTTP_400_BAD_REQUEST
             )
         try:
             uuid.UUID(idempotency_key)
         except ValueError:
-            return Response(
-                {"error": "Idempotency-Key must be a valid UUID"},
-                status=status.HTTP_400_BAD_REQUEST
+            logger.warning(f"Invalid Idempotency-Key format: {idempotency_key}")
+            code, message = ValidationError.INVALID_UUID
+            return APIResponse.error(
+                error="Idempotency-Key must be a valid UUID",
+                code=code,
+                status_code=status.HTTP_400_BAD_REQUEST
             )
 
         merchant_id = request.data.get("merchant_id")
@@ -75,18 +185,33 @@ class PayoutCreateView(APIView):
 
         # Input validation
         if not all([merchant_id, amount_paise, bank_account_id]):
-            return Response({"error": "Missing required fields"},
-                             status=status.HTTP_400_BAD_REQUEST)
+            logger.warning("Payout creation request missing required fields")
+            code, message = ValidationError.MISSING_FIELD
+            return APIResponse.error(
+                error="Missing required fields: merchant_id, amount_paise, bank_account_id",
+                code=code,
+                status_code=status.HTTP_400_BAD_REQUEST
+            )
 
         if not isinstance(amount_paise, int) or amount_paise <= 0:
-            return Response({"error": "amount_paise must be a positive integer"},
-                             status=status.HTTP_400_BAD_REQUEST)
+            logger.warning(f"Invalid amount_paise: {amount_paise}")
+            code, message = ValidationError.INVALID_TYPE
+            return APIResponse.error(
+                error="amount_paise must be a positive integer",
+                code=code,
+                status_code=status.HTTP_400_BAD_REQUEST
+            )
 
         try:
             merchant = Merchant.objects.get(pk=merchant_id)
         except Merchant.DoesNotExist:
-            return Response({"error": "Merchant not found"},
-                             status=status.HTTP_404_NOT_FOUND)
+            logger.warning(f"Merchant {merchant_id} not found in payout creation")
+            code, message = ValidationError.NOT_FOUND
+            return APIResponse.error(
+                error="Merchant not found",
+                code=code,
+                status_code=status.HTTP_404_NOT_FOUND
+            )
 
         try:
             result = create_payout(
@@ -95,21 +220,49 @@ class PayoutCreateView(APIView):
                 bank_account_id=bank_account_id,
                 idempotency_key=idempotency_key,
             )
+            # For idempotent responses, return 200 OK; for new payouts, return 201 Created
             return Response(result["data"], status=result["status"])
 
         except ValueError as e:
-            return Response({"error": str(e)},
-                             status=status.HTTP_422_UNPROCESSABLE_ENTITY)
+            error_msg = str(e)
+            logger.warning(f"Payout creation validation error: {error_msg}")
+            
+            # Determine error code based on message
+            if "Insufficient balance" in error_msg:
+                code = ValidationError.INSUFFICIENT_BALANCE[0]
+            elif "Invalid bank account" in error_msg:
+                code = ValidationError.INVALID_BANK_ACCOUNT[0]
+            else:
+                code = ValidationError.INVALID_TYPE[0]
+            
+            return APIResponse.error(
+                error=error_msg,
+                code=code,
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY
+            )
 
 
 class PayoutDetailView(APIView):
-    """GET /api/v1/payouts/{id}/"""
+    """GET /api/v1/payouts/{id}/
+    
+    Retrieve details for a specific payout by its ID.
+    
+    Returns:
+        200 OK: Payout details
+        404 Not Found: Payout ID not found
+    """
     def get(self, request, payout_id):
         try:
             payout = Payout.objects.get(pk=payout_id)
         except Payout.DoesNotExist:
-            return Response({"error": "Payout not found"},
-                             status=status.HTTP_404_NOT_FOUND)
+            logger.warning(f"Payout {payout_id} not found")
+            code, message = ValidationError.NOT_FOUND
+            return APIResponse.error(
+                error="Payout not found",
+                code=code,
+                status_code=status.HTTP_404_NOT_FOUND
+            )
 
         serializer = PayoutSerializer(payout)
-        return Response(serializer.data)
+        logger.debug(f"Retrieved payout {payout_id}")
+        return APIResponse.success(data=serializer.data, status_code=200)

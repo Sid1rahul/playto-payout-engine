@@ -3,22 +3,30 @@ Core business logic for payouts.
 All balance operations, state transitions, and fund holds happen here.
 """
 
+import logging
 from django.db import transaction
 from django.db.models import Sum, Value
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 from datetime import timedelta
+from django.db import IntegrityError
 from .models import Merchant, Payout, Transaction, IdempotencyRecord, BankAccount
+
+logger = logging.getLogger('payouts')
 
 
 def _serialize_payout(payout: Payout) -> dict:
-    """Serialize a payout to JSON-serializable dict."""
+    """Serialize a payout to JSON-serializable dict with all relevant fields."""
     return {
         "id": str(payout.id),
         "merchant_id": str(payout.merchant_id),
+        "bank_account_id": str(payout.bank_account_id),
         "amount_paise": payout.amount_paise,
         "status": payout.status,
-        "bank_account_id": str(payout.bank_account_id),
+        "idempotency_key": payout.idempotency_key,
+        "attempt_count": payout.attempt_count,
+        "failure_reason": payout.failure_reason or None,
+        "processing_started_at": payout.processing_started_at.isoformat() if payout.processing_started_at else None,
         "created_at": payout.created_at.isoformat(),
         "updated_at": payout.updated_at.isoformat(),
     }
@@ -41,6 +49,7 @@ def create_payout(merchant: Merchant, amount_paise: int,
             - status: HTTP status code (201 or 200)
             - cached: boolean indicating if this was a cached response
     """
+    logger.info(f"Creating payout for merchant {merchant.id} with idempotency_key {idempotency_key}")
 
     # Step 1: Check idempotency BEFORE acquiring any lock
     record = IdempotencyRecord.objects.filter(
@@ -50,6 +59,7 @@ def create_payout(merchant: Merchant, amount_paise: int,
     ).select_related("payout").first()
 
     if record:
+        logger.info(f"Returning cached response for idempotency_key {idempotency_key}")
         return {
             "data": record.response_body,
             "status": record.response_status,
@@ -62,6 +72,7 @@ def create_payout(merchant: Merchant, amount_paise: int,
             id=bank_account_id, merchant=merchant, is_active=True
         )
     except BankAccount.DoesNotExist:
+        logger.warning(f"Invalid bank account {bank_account_id} for merchant {merchant.id}")
         raise ValueError("Invalid bank account")
 
     # Step 3: Atomic balance check + fund hold
@@ -87,6 +98,10 @@ def create_payout(merchant: Merchant, amount_paise: int,
         available = credits - debits - held
 
         if available < amount_paise:
+            logger.warning(
+                f"Insufficient balance for merchant {merchant.id}. "
+                f"Available: {available} paise, Requested: {amount_paise} paise"
+            )
             raise ValueError(
                 f"Insufficient balance. Available: {available} paise, "
                 f"Requested: {amount_paise} paise"
@@ -94,13 +109,28 @@ def create_payout(merchant: Merchant, amount_paise: int,
 
         # Funds are "held" implicitly: any pending/processing payout
         # is excluded from available balance in future calculations.
-        payout = Payout.objects.create(
-            merchant=merchant_locked,
-            bank_account=bank_account,
-            amount_paise=amount_paise,
-            status=Payout.PENDING,
-            idempotency_key=idempotency_key,
-        )
+        
+
+        try:
+            payout = Payout.objects.create(
+                merchant=merchant_locked,
+                bank_account=bank_account,
+                amount_paise=amount_paise,
+                status=Payout.PENDING,
+                idempotency_key=idempotency_key,
+            )
+            logger.info(f"Created payout {payout.id} for merchant {merchant.id} with amount {amount_paise} paise")
+
+        except IntegrityError:
+            # another request already created it
+            existing = Payout.objects.get(idempotency_key=idempotency_key)
+            logger.info(f"Payout already created for idempotency_key {idempotency_key}, returning existing payout {existing.id}")
+
+            return {
+                "data": _serialize_payout(existing),
+                "status": 200,
+                "cached": True
+            }
 
         response_body = _serialize_payout(payout)
         response_status = 201
@@ -118,6 +148,7 @@ def create_payout(merchant: Merchant, amount_paise: int,
     # (if the task fires before the txn commits, it won't find the payout)
     from .tasks import process_payout
     process_payout.apply_async(args=[str(payout.id)], countdown=2)
+    logger.debug(f"Enqueued background processing for payout {payout.id}")
 
     return {
         "data": response_body,
@@ -151,7 +182,10 @@ def transition_payout(payout: Payout, new_status: str,
     Raises:
         ValueError: If the transition is illegal
     """
+    logger.info(f"Transitioning payout {payout.id} from {payout.status} to {new_status}")
+    
     if new_status not in Payout.VALID_TRANSITIONS.get(payout.status, []):
+        logger.error(f"Illegal transition: {payout.status} → {new_status}")
         raise ValueError(
             f"Illegal transition: {payout.status} → {new_status}"
         )
@@ -163,6 +197,7 @@ def transition_payout(payout: Payout, new_status: str,
         # Re-validate after lock (status may have changed between
         # the first fetch and acquiring the lock)
         if new_status not in Payout.VALID_TRANSITIONS.get(payout.status, []):
+            logger.error(f"Illegal transition after lock: {payout.status} → {new_status}")
             raise ValueError(
                 f"Illegal transition after lock: {payout.status} → {new_status}"
             )
@@ -181,6 +216,7 @@ def transition_payout(payout: Payout, new_status: str,
                 description=f"Refund for failed payout {payout.id}",
                 payout=payout,
             )
+            logger.info(f"Refund created for failed payout {payout.id}")
 
         if new_status == Payout.COMPLETED:
             # Finalize the debit when payout actually completes
@@ -191,5 +227,6 @@ def transition_payout(payout: Payout, new_status: str,
                 description=f"Payout to bank account {payout.bank_account_id}",
                 payout=payout,
             )
+            logger.info(f"Completed payout {payout.id}")
 
     return payout
