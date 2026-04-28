@@ -1,0 +1,226 @@
+{
+  "info": {
+    "name": "Playto Payout Engine API",
+    "description": "Collection for testing Playto Payout Engine endpoints",
+    "version": "1.0.0"
+  },
+  "item": [
+    {
+      "name": "Merchants",
+      "item": [
+        {
+          "name": "Get Merchant Balance",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/merchants/{{merchant_id}}/balance/",
+              "host": ["{{base_url}}"],
+              "path": ["merchants", "{{merchant_id}}", "balance", ""]
+            },
+            "description": "Get the current balance for a merchant"
+          },
+          "response": []
+        },
+        {
+          "name": "Get Merchant Transactions",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/merchants/{{merchant_id}}/transactions/?limit=100",
+              "host": ["{{base_url}}"],
+              "path": ["merchants", "{{merchant_id}}", "transactions", ""],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "100"
+                }
+              ]
+            },
+            "description": "Get transaction history for a merchant"
+          },
+          "response": []
+        },
+        {
+          "name": "Get Merchant Payouts",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/merchants/{{merchant_id}}/payouts/?status=pending&limit=100",
+              "host": ["{{base_url}}"],
+              "path": ["merchants", "{{merchant_id}}", "payouts", ""],
+              "query": [
+                {
+                  "key": "status",
+                  "value": "pending"
+                },
+                {
+                  "key": "limit",
+                  "value": "100"
+                }
+              ]
+            },
+            "description": "Get payout history for a merchant with optional filtering"
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Payouts",
+      "item": [
+        {
+          "name": "Create Payout",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$randomUUID}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"merchant_id\": \"{{merchant_id}}\",\n  \"amount_paise\": 100000,\n  \"bank_account_id\": \"{{bank_account_id}}\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/payouts/",
+              "host": ["{{base_url}}"],
+              "path": ["payouts", ""]
+            },
+            "description": "Create a new payout request with idempotency key"
+          },
+          "response": []
+        },
+        {
+          "name": "Get Payout Details",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/payouts/{{payout_id}}/",
+              "host": ["{{base_url}}"],
+              "path": ["payouts", "{{payout_id}}", ""]
+            },
+            "description": "Retrieve details for a specific payout"
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Error Cases",
+      "item": [
+        {
+          "name": "Create Payout - Missing Idempotency Key",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"merchant_id\": \"{{merchant_id}}\",\n  \"amount_paise\": 50000,\n  \"bank_account_id\": \"{{bank_account_id}}\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/payouts/",
+              "host": ["{{base_url}}"],
+              "path": ["payouts", ""]
+            },
+            "description": "Should return 400 - Missing Idempotency-Key header"
+          },
+          "response": []
+        },
+        {
+          "name": "Get Merchant Balance - Invalid Merchant",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/merchants/00000000-0000-0000-0000-000000000000/balance/",
+              "host": ["{{base_url}}"],
+              "path": ["merchants", "00000000-0000-0000-0000-000000000000", "balance", ""]
+            },
+            "description": "Should return 404 - Merchant not found"
+          },
+          "response": []
+        },
+        {
+          "name": "Get Payout - Invalid Payout ID",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/payouts/00000000-0000-0000-0000-000000000000/",
+              "host": ["{{base_url}}"],
+              "path": ["payouts", "00000000-0000-0000-0000-000000000000", ""]
+            },
+            "description": "Should return 404 - Payout not found"
+          },
+          "response": []
+        }
+      ]
+    }
+  ],
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://localhost:8000/api/v1",
+      "type": "string"
+    },
+    {
+      "key": "merchant_id",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "bank_account_id",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "payout_id",
+      "value": "",
+      "type": "string"
+    }
+  ]
+}
