@@ -16,6 +16,32 @@ from .utils import APIResponse, ValidationError
 logger = logging.getLogger('payouts')
 
 
+class DebugSeedDataView(APIView):
+    """GET /api/v1/debug/seed-data/"""
+    def get(self, request):
+        merchants = [
+            {
+                "id": str(merchant.id),
+                "name": merchant.name,
+                "balance": merchant.get_available_balance(),
+            }
+            for merchant in Merchant.objects.all().order_by("name")
+        ]
+
+        bank_accounts = [
+            {
+                "id": str(bank_account.id),
+                "merchant_id": str(bank_account.merchant_id),
+            }
+            for bank_account in BankAccount.objects.all().order_by("created_at")
+        ]
+
+        return Response({
+            "merchants": merchants,
+            "bank_accounts": bank_accounts,
+        })
+
+
 class MerchantBalanceView(APIView):
     """GET /api/v1/merchants/{id}/balance/
     
